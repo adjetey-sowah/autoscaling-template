@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Auto Scaling Apache Web Server with ALB
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+  PublicSubnetCidr:
+    Type: String
+    Default: 10.0.1.0/24
+  PrivateSubnetCidr:
+    Type: String
+    Default: 10.0.2.0/24
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  WebServerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: WebServerLaunchTemplate
+      LaunchTemplateData:
+        ImageId: ami-0c55b159cbfafe1f0  # Amazon Linux 2 AMI (us-east-1)
+        InstanceType: t2.micro
+        KeyName: !Ref KeyName
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd stress
+            systemctl start httpd
+            systemctl enable httpd
+
+            # Configure Apache for CGI
+            mkdir -p /var/www/cgi-bin
+            echo "ScriptAlias /cgi-bin/ \"/var/www/cgi-bin/\"" > /etc/httpd/conf.d/cgi.conf
+            echo "<Directory \"/var/www/cgi-bin\">" >> /etc/httpd/conf.d/cgi.conf
+            echo "    AllowOverride None" >> /etc/httpd/conf.d/cgi.conf
+            echo "    Options +ExecCGI" >> /etc/httpd/conf.d/cgi.conf
+            echo "    AddHandler cgi-script .cgi" >> /etc/httpd/conf.d/cgi.conf
+            echo "    Require all granted" >> /etc/httpd/conf.d/cgi.conf
+            echo "</Directory>" >> /etc/httpd/conf.d/cgi.conf
+
+            # Allow Apache user to run stress
+            echo "apache ALL=(ALL) NOPASSWD: /usr/bin/stress" > /etc/sudoers.d/apache-stress
+            chmod 440 /etc/sudoers.d/apache-stress
+
+            # Get instance metadata
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+
+            # Create HTML file
+            cat <<EOF > /var/www/html/index.html
+            <html>
+            <head><title>Hello</title></head>
+            <body>
+            <h1>Hello from ${PRIVATE_IP} / ${INSTANCE_ID}</h1>
+            <form action="/cgi-bin/stress.cgi" method="post">
+            <button type="submit">Stress CPU</button>
+            </form>
+            </body>
+            </html>
+            EOF
+
+            # Create stress CGI script
+            cat <<EOF > /var/www/cgi-bin/stress.cgi
+            #!/bin/bash
+            echo "Content-type: text/html"
+            echo ""
+            echo "<html><head><meta http-equiv='refresh' content='0; url=/'></head><body>Starting CPU stress for 60 seconds...</body></html>"
+            sudo stress --cpu 2 --timeout 60 > /dev/null 2>&1 &
+            EOF
+
+            chmod +x /var/www/cgi-bin/stress.cgi
+
+            systemctl restart httpd
+
+  WebServerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: WebServerASG
+      LaunchTemplate:
+        LaunchTemplateName: !Ref WebServerLaunchTemplate
+        Version: !GetAtt WebServerLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet
+      TargetGroupARNs:
+        - !Ref WebServerTargetGroup
+
+  WebServerTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: WebServerTargetGroup
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  WebServerALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: WebServerALB
+      Subnets:
+        - !Ref PublicSubnet
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Scheme: internet-facing
+      Type: application
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebServerALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebServerTargetGroup
+
+  WebServerScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyType: TargetTrackingScaling
+      AutoScalingGroupName: !Ref WebServerASG
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50.0
+
+Outputs:
+  ALBDNSName:
+    Description: DNS name of the ALB
+    Value: !GetAtt WebServerALB.DNSName
